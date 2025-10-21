@@ -1,13 +1,15 @@
 #!/usr/bin/env python3
 """
-ADS-B (dump1090 SBS) → Meshtastic bridge
-15-minute batch mode • with flags • on-demand connect
+ADS-B (dump1090 SBS) → Meshtastic bridge (15-minute batch mode, with flags, on-demand connect, 1 s send delay)
 
-This version:
-- Connects to Meshtastic only when sending a batch (connect → send → disconnect).
-- Keeps 200-char message cap.
-- Supports flag emojis via PyModeS or built-in ICAO ranges.
-- Insert your full ICAO_ALLOC_RANGES below.
+• Collects aircraft data from dump1090 SBS stream.
+• Every N minutes (default 15) builds a compact summary ≤ MAX_MESSAGE_BYTES (UTF-8 safe).
+• Connects to Meshtastic only when sending → waits 1 second → sends → disconnects.
+• Includes flag emojis using PyModeS or the built-in ICAO allocation table.
+
+Environment:
+  DUMP1090_HOST, DUMP1090_PORT, MESHTASTIC_TCP_HOST, MESHTASTIC_CHANNEL_INDEX,
+  BATCH_MINUTES, MAX_MESSAGE_BYTES, LOG_LEVEL, STATION_LAT, STATION_LON
 """
 
 import argparse
@@ -40,16 +42,15 @@ DEFAULT_MESH_HOST = os.getenv("MESHTASTIC_TCP_HOST", "10.200.10.16")
 DEFAULT_MESH_CHANNEL_INDEX = int(os.getenv("MESHTASTIC_CHANNEL_INDEX", "4"))
 DEFAULT_LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO")
 DEFAULT_BATCH_MINUTES = int(os.getenv("BATCH_MINUTES", "15"))
-DEFAULT_MAX_CHARS = int(os.getenv("MAX_MESSAGE_CHARS", "200"))
+DEFAULT_MAX_BYTES = int(os.getenv("MAX_MESSAGE_BYTES", "200"))
 
 STATION_LAT = float(os.getenv("STATION_LAT")) if os.getenv("STATION_LAT") else None
 STATION_LON = float(os.getenv("STATION_LON")) if os.getenv("STATION_LON") else None
 
 # ---------------------------
-# ICAO allocation table
+# ICAO allocation table (insert your full table here)
 # ---------------------------
 ICAO_ALLOC_RANGES = [
-    # ⬇️ INSERT YOUR FULL ICAO TABLE HERE ⬇️
     {"start": int("000000",16), "end": int("003FFF",16), "country": "Unassigned"},
     {"start": int("004000",16), "end": int("0043FF",16), "country": "Zimbabwe"},
     {"start": int("006000",16), "end": int("006FFF",16), "country": "Mozambique"},
@@ -236,7 +237,6 @@ ICAO_ALLOC_RANGES = [
     {"start": int("E90000",16), "end": int("E90FFF",16), "country": "Uruguay"},
     {"start": int("E94000",16), "end": int("E94FFF",16), "country": "Bolivia (Plurinational State of)"},
 ]
-
 # ---------------------------
 # Globals
 # ---------------------------
@@ -275,8 +275,8 @@ def flag_emoji(cc: Optional[str]) -> Optional[str]:
     if not cc or len(cc) != 2:
         return None
     base = 0x1F1E6
-    a = ord(cc[0].upper()) - ord('A')
-    b = ord(cc[1].upper()) - ord('A')
+    a = ord(cc[0].upper()) - ord("A")
+    b = ord(cc[1].upper()) - ord("A")
     if not (0 <= a < 26 and 0 <= b < 26):
         return None
     return chr(base + a) + chr(base + b)
@@ -285,11 +285,17 @@ def _country_to_cc(country: Optional[str]) -> Optional[str]:
     if not country:
         return None
     aliases = {
-        "Viet Nam": "VN", "Türkiye": "TR",
-        "Cote d'Ivoire": "CI", "Cote d Ivoire": "CI",
-        "Swaziland": "SZ", "Laos": "LA", "Lao": "LA",
-        "Burma": "MM", "Myanmar": "MM",
-        "North Korea": "KP", "South Korea": "KR",
+        "Viet Nam": "VN",
+        "Türkiye": "TR",
+        "Cote d'Ivoire": "CI",
+        "Cote d Ivoire": "CI",
+        "Swaziland": "SZ",
+        "Laos": "LA",
+        "Lao": "LA",
+        "Burma": "MM",
+        "Myanmar": "MM",
+        "North Korea": "KP",
+        "South Korea": "KR",
         "Taiwan (unofficial)": "TW",
     }
     if country in aliases:
@@ -308,20 +314,20 @@ def _modes_country_lookup(icao_hex: str) -> Optional[str]:
     icao_hex = (icao_hex or "").strip().upper()
     if len(icao_hex) != 6:
         return None
-    for func in [
-        lambda x: pms.icao.country(x),
-        lambda x: getattr(getattr(pms, "icao24", None), "country")(x)
-        if getattr(pms, "icao24", None) else None,
-        lambda x: pms.icao.country(int(x, 16)),
-        lambda x: getattr(getattr(pms, "icao24", None), "country")(int(x, 16))
-        if getattr(pms, "icao24", None) else None,
-    ]:
-        try:
-            c = func(icao_hex)
+    try:
+        c = pms.icao.country(icao_hex)
+        if c:
+            return c
+    except Exception:
+        pass
+    try:
+        icao24_mod = getattr(pms, "icao24", None)
+        if icao24_mod:
+            c = icao24_mod.country(icao_hex)
             if c:
                 return c
-        except Exception:
-            pass
+    except Exception:
+        pass
     return None
 
 def registration_country_for_icao(hex_addr: str) -> Tuple[Optional[str], Optional[str]]:
@@ -340,6 +346,23 @@ def registration_country_for_icao(hex_addr: str) -> Tuple[Optional[str], Optiona
 
 def bounded_position(lat: float, lon: float) -> bool:
     return -90 <= lat <= 90 and -180 <= lon <= 180
+
+# ---------------------------
+# Meshtastic: connect → delay → send → close
+# ---------------------------
+def send_meshtastic_text(mesh_host: str, channel_index: int, text: str) -> bool:
+    """Connect to Meshtastic, wait 1s, send, then close."""
+    try:
+        iface = TCPInterface(hostname=mesh_host)
+        logging.debug("Connected to Meshtastic, waiting 1 second before send...")
+        time.sleep(1.0)
+        iface.sendText(text, channelIndex=channel_index)
+        iface.close()
+        logging.info("Meshtastic: sent %d bytes", len(text.encode("utf-8")))
+        return True
+    except Exception:
+        logging.exception("Meshtastic send failed")
+        return False
 
 # ---------------------------
 # SBS reader
@@ -370,8 +393,7 @@ def sbs_reader(host: str, port: int):
                     with data_lock:
                         st = aircraft_data.setdefault(
                             icao,
-                            {"lat": None, "lon": None, "alt": None,
-                             "callsign": None, "last_seen": 0.0},
+                            {"lat": None, "lon": None, "alt": None, "callsign": None, "last_seen": 0.0},
                         )
                         st["last_seen"] = now
                         if tx_type in (1, 2, 3, 4) and len(parts) > 10:
@@ -390,22 +412,23 @@ def sbs_reader(host: str, port: int):
                             if alt is not None and alt >= 100:
                                 st["alt"] = alt
         except Exception as e:
-            logging.error("SBS thread error: %s", e)
+            logging.error("SBS connection error: %s", e)
         finally:
             if s:
-                try: s.close()
-                except Exception: pass
+                try:
+                    s.close()
+                except Exception:
+                    pass
             delay = min(backoff, 30) + random.uniform(0, 1.5)
             logging.info("Reconnecting to SBS in %.1fs", delay)
             stop_event.wait(delay)
             backoff = min(backoff * 1.7, 30)
 
 # ---------------------------
-# Batch building and sending
+# Batch building + byte-safe limiter
 # ---------------------------
 def _pick_examples(rows: List[Tuple[str, dict]], max_examples: int = 5):
-    rows = sorted(rows, key=lambda x: (0 if x[1].get("callsign") else 1,
-                                       -x[1].get("last_seen", 0)))
+    rows = sorted(rows, key=lambda x: (0 if x[1].get("callsign") else 1, -x[1].get("last_seen", 0)))
     return rows[:max_examples]
 
 def _ident_for(icao: str, st: dict) -> str:
@@ -418,64 +441,48 @@ def _flag_for_icao(icao: str) -> str:
 
 def build_summary(now: float, window_start: float) -> str:
     with data_lock:
-        rows = [(icao, st.copy()) for icao, st in aircraft_data.items()
-                if st.get("last_seen", 0) >= window_start]
+        rows = [(icao, st.copy()) for icao, st in aircraft_data.items() if st.get("last_seen", 0) >= window_start]
     count = len(rows)
     if count == 0:
         return "✈️ 15m: no planes"
     examples = _pick_examples(rows, 6)
     parts = []
     for icao, st in examples:
-        parts.append(f"{_flag_for_icao(icao)}{_ident_for(icao, st)} "
-                     f"{kft(st.get('alt'))} {human_coords_short(st.get('lat'), st.get('lon'))}")
+        parts.append(f"{_flag_for_icao(icao)}{_ident_for(icao, st)} {kft(st.get('alt'))} {human_coords_short(st.get('lat'), st.get('lon'))}")
     head = f"✈️ {int(round((now - window_start) / 60.0))}m: {count} planes. "
     msg = head + "; ".join(parts)
     return msg
 
-def hard_limit(msg: str, limit: int) -> str:
-    if len(msg) <= limit:
+def hard_limit_bytes(msg: str, max_bytes: int) -> str:
+    b = msg.encode("utf-8")
+    if len(b) <= max_bytes:
         return msg
-    ell = "…"
-    cut = max(limit - len(ell), 0)
-    cand = msg[:cut]
-    for sep in ["; ", " ", ","]:
-        idx = cand.rfind(sep)
-        if idx >= 0 and idx > 12:
-            cand = cand[:idx]
-            break
-    return cand.rstrip(" ;,") + ell
-
-def send_meshtastic_text(host: str, channel_index: int, text: str, retry: int = 1) -> bool:
-    """Connect → send → disconnect (retry once if fails)."""
-    for attempt in range(retry + 1):
+    ell = "…".encode("utf-8")
+    keep = max_bytes - len(ell)
+    if keep <= 0:
+        return "…"
+    trimmed = b[:keep]
+    while True:
         try:
-            logging.info("Meshtastic: connecting to %s:4403", host)
-            iface = TCPInterface(hostname=host)
-            iface.sendText(text, channelIndex=channel_index)
-            logging.info("Meshtastic: sent (%d chars)", len(text))
-            try: iface.close()
-            except Exception: pass
-            return True
-        except Exception:
-            logging.exception("Meshtastic send attempt %d failed", attempt + 1)
-            try: iface.close()  # type: ignore[name-defined]
-            except Exception: pass
-            if attempt < retry:
-                time.sleep(1.0)
-    return False
+            return trimmed.decode("utf-8") + "…"
+        except UnicodeDecodeError:
+            trimmed = trimmed[:-1]
 
-def batch_sender(mesh_host: str, channel_index: int, batch_minutes: int, max_chars: int):
+def batch_sender(mesh_host: str, channel_index: int, batch_minutes: int, max_bytes: int):
     global batch_window_start
     while not stop_event.is_set():
         stop_event.wait(batch_minutes * 60)
-        if stop_event.is_set(): break
+        if stop_event.is_set():
+            break
         now = time.time()
         try:
             msg = build_summary(now, batch_window_start)
-            msg = hard_limit(msg, max_chars)
-            ok = send_meshtastic_text(mesh_host, channel_index, msg, retry=1)
-            if not ok:
-                logging.warning("Batch NOT sent after retry")
+            msg = hard_limit_bytes(msg, max_bytes)
+            ok = send_meshtastic_text(mesh_host, channel_index, msg)
+            if ok:
+                logging.info("Batch sent (%d bytes)", len(msg.encode("utf-8")))
+            else:
+                logging.warning("Batch NOT sent")
         except Exception:
             logging.exception("Failed to build/send batch message")
         finally:
@@ -485,13 +492,13 @@ def batch_sender(mesh_host: str, channel_index: int, batch_minutes: int, max_cha
 # CLI & main
 # ---------------------------
 def parse_args():
-    p = argparse.ArgumentParser(description="Bridge dump1090 SBS → Meshtastic (15m batches, flags, on-demand)")
+    p = argparse.ArgumentParser(description="Bridge dump1090 SBS → Meshtastic (15 min batches, 1 s delay)")
     p.add_argument("--dump1090-host", default=DEFAULT_DUMP1090_HOST)
     p.add_argument("--dump1090-port", type=int, default=DEFAULT_DUMP1090_PORT)
     p.add_argument("--mesh-host", default=DEFAULT_MESH_HOST)
     p.add_argument("--mesh-channel-index", type=int, default=DEFAULT_MESH_CHANNEL_INDEX)
     p.add_argument("--batch-minutes", type=int, default=DEFAULT_BATCH_MINUTES)
-    p.add_argument("--max-chars", type=int, default=DEFAULT_MAX_CHARS)
+    p.add_argument("--max-bytes", type=int, default=DEFAULT_MAX_BYTES)
     p.add_argument("--log-level", default=DEFAULT_LOG_LEVEL, choices=["DEBUG","INFO","WARNING","ERROR"])
     p.add_argument("--self-test", action="store_true", help="Build a synthetic message and exit")
     return p.parse_args()
@@ -501,26 +508,26 @@ def main():
     setup_logging(args.log_level)
     if args.self_test:
         global batch_window_start
-        batch_window_start = time.time() - 15*60
+        batch_window_start = time.time() - 15 * 60
         with data_lock:
             for i, (icao, cs) in enumerate(
-                [("738ABC","ELY32A"),("A1B2C3","N123AB"),("400123","BAW9"),
-                 ("3C45F6","DLH4"),("4B8A9C","THY7"),("7C0F0F","QFA2")], 1):
+                [("738ABC","ELY32A"),("A1B2C3","N123AB"),("400123","BAW9"),("3C45F6","DLH4"),("4B8A9C","THY7"),("7C0F0F","QFA2")], 1):
                 aircraft_data[icao] = {"callsign": cs, "alt": 29000+i*1000,
                                        "lat": 32+i*0.07, "lon": 34.8+i*0.06,
                                        "last_seen": time.time()}
         msg = build_summary(time.time(), batch_window_start)
-        print(hard_limit(msg, args.max_chars))
+        print(hard_limit_bytes(msg, args.max_bytes))
         return
-    logging.info("SBS → Meshtastic | dump1090=%s:%d | mesh=%s | idx=%d | batch=%dm | max=%d chars",
+    logging.info("SBS → Meshtastic | dump1090=%s:%d | mesh=%s | idx=%d | batch=%dm | max=%d bytes",
                  args.dump1090_host,args.dump1090_port,args.mesh_host,args.mesh_channel_index,
-                 args.batch_minutes,args.max_chars)
+                 args.batch_minutes,args.max_bytes)
     threading.Thread(target=sbs_reader,args=(args.dump1090_host,args.dump1090_port),
                      daemon=True,name="sbs-reader").start()
     threading.Thread(target=batch_sender,args=(args.mesh_host,args.mesh_channel_index,
-                     args.batch_minutes,args.max_chars),daemon=True,name="batch-sender").start()
+                     args.batch_minutes,args.max_bytes),daemon=True,name="batch-sender").start()
     try:
-        while not stop_event.is_set(): time.sleep(0.5)
+        while not stop_event.is_set():
+            time.sleep(0.5)
     except KeyboardInterrupt:
         logging.info("Shutdown requested (Ctrl+C)")
     finally:
